@@ -1,966 +1,476 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-st.set_page_config(
-   page_title="GA Trading Optimizer",
-   page_icon="📈",
-   layout="wide"
-)
-st.title("📈 Genetic Algorithm Trading")
-st.write("ระบบทดลองปรับกลยุทธ์ Trading ด้วย Genetic Algorithm")
-st.divider()
-st.header("1. ตั้งค่าเงินทุน")
-capital = st.number_input(
-   "เงินทุนเริ่มต้น (USD)",
-   min_value=100,
-   max_value=1000000,
-   value=10000,
-   step=1000
-)
-st.metric("เงินทุนเริ่มต้น", f"${capital:,.2f}")
-st.divider()
-st.header("2. ตั้งค่ากลยุทธ์ Trading")
-col1, col2 = st.columns(2)
-with col1:
-   short_window = st.number_input(
-       "Short Moving Average",
-       min_value=2,
-       max_value=50,
-       value=5
-   )
-with col2:
-   long_window = st.number_input(
-       "Long Moving Average",
-       min_value=10,
-       max_value=200,
-       value=20
-   )
-if short_window >= long_window:
-   st.warning("Short MA ควรน้อยกว่า Long MA")
-else:
-   st.success(
-       f"Short MA = {short_window}, Long MA = {long_window}"
-   )
-st.divider()
-st.header("3. ข้อมูลราคาหุ้นย้อนหลัง")
-symbol = st.text_input(
-   "Ticker Symbol",
-   value="AAPL",
-   help="ตัวอย่าง AAPL = Apple, MSFT = Microsoft"
-).strip().upper()
-period = st.selectbox(
-   "ช่วงเวลาข้อมูล",
-   ["1mo", "3mo", "6mo", "1y", "2y"],
-   index=3
-)
-if st.button("ดึงข้อมูลราคาหุ้น"):
-   if not symbol:
-       st.error("กรุณากรอก Ticker Symbol")
-   else:
-       with st.spinner("กำลังดึงข้อมูล..."):
-           try:
-               data = yf.download(
-                   symbol,
-                   period=period,
-                   auto_adjust=True,
-                   progress=False
-               )
-               if data.empty:
-                   st.error("ไม่พบข้อมูล กรุณาตรวจสอบ Ticker Symbol")
-               else:
-                   if isinstance(data.columns, pd.MultiIndex):
-                       data.columns = data.columns.get_level_values(0)
-                   data = data.reset_index()
-                   st.success(f"โหลดข้อมูล {symbol} สำเร็จ")
-                   st.line_chart(
-                       data.set_index("Date")["Close"],
-                       y_label="Price (USD)"
-                   )
-                   st.subheader("ข้อมูลราคาล่าสุด")
-                   st.dataframe(data.tail(10), use_container_width=True)
-           except Exception as e:
-               st.error(f"ดึงข้อมูลไม่สำเร็จ: {e}")
-st.info("ตรวจสอบอินเทอร์เน็ตและ Ticker Symbol อีกครั้ง")
-# 4. ระบบ Backtest กลยุทธ์ Trading
-st.divider()
-st.header("4. Backtest กลยุทธ์ Trading")
-st.write(
-   "จำลองการซื้อขายย้อนหลังด้วยกลยุทธ์ "
-   "Moving Average Crossover"
-)
-if st.button("เริ่ม Backtest"):
-   try:
-       # ดาวน์โหลดข้อมูลหุ้น
-       prices = yf.download(
-           symbol,
-           period=period,
-           auto_adjust=True,
-           progress=False
-       )
-       if prices.empty:
-           st.error("ไม่พบข้อมูลราคาหุ้น")
-       else:
-           # รองรับข้อมูลคอลัมน์หลายระดับ
-           if isinstance(prices.columns, pd.MultiIndex):
-               prices.columns = prices.columns.get_level_values(0)
-           prices = prices[["Close"]].copy()
-           prices["Short_MA"] = prices["Close"].rolling(
-               window=int(short_window)
-           ).mean()
-           prices["Long_MA"] = prices["Close"].rolling(
-               window=int(long_window)
-           ).mean()
-           # สัญญาณ: ถือหุ้นเมื่อ Short MA > Long MA
-           prices["Signal"] = (
-               prices["Short_MA"] > prices["Long_MA"]
-           ).astype(int)
-           # ใช้สัญญาณจากวันก่อนหน้า เพื่อลด look-ahead bias
-           prices["Position"] = prices["Signal"].shift(1).fillna(0)
-           # ผลตอบแทนรายวันของหุ้นและกลยุทธ์
-           prices["Market_Return"] = prices["Close"].pct_change().fillna(0)
-           prices["Strategy_Return"] = (
-               prices["Position"] * prices["Market_Return"]
-           )
-           # จำลองเงินทุนสะสม
-           prices["Equity"] = capital * (
-               1 + prices["Strategy_Return"]
-           ).cumprod()
-           # เปรียบเทียบกับการซื้อแล้วถือ
-           prices["Buy_Hold_Equity"] = capital * (
-               1 + prices["Market_Return"]
-           ).cumprod()
-           total_return = (
-               prices["Equity"].iloc[-1] / capital - 1
-           ) * 100
-           buy_hold_return = (
-               prices["Buy_Hold_Equity"].iloc[-1] / capital - 1
-           ) * 100
-           running_peak = prices["Equity"].cummax()
-           drawdown = prices["Equity"] / running_peak - 1
-           max_drawdown = drawdown.min() * 100
-           col1, col2, col3 = st.columns(3)
-           col1.metric("เงินทุนปลายงวด", f"${prices['Equity'].iloc[-1]:,.2f}")
-           col2.metric("ผลตอบแทนกลยุทธ์", f"{total_return:.2f}%")
-           col3.metric("Max Drawdown", f"{max_drawdown:.2f}%")
-           st.subheader("กราฟเงินทุนจำลอง")
-           st.line_chart(
-               prices[["Equity", "Buy_Hold_Equity"]],
-               y_label="Equity (USD)"
-           )
-           st.subheader("ข้อมูล Backtest ล่าสุด")
-           st.dataframe(prices.tail(10), use_container_width=True)
-           st.caption(
-               f"Buy & Hold Return: {buy_hold_return:.2f}% "
-               "| ผลจำลองยังไม่รวมค่าธรรมเนียมและ Slippage"
-           )
-   except Exception as e:
-       st.error(f"Backtest ไม่สำเร็จ: {e}")
-# 5. Genetic Algorithm Optimizer
 import random
-st.divider()
-st.header("5. Genetic Algorithm Optimizer")
-st.write(
-   "ให้ Genetic Algorithm ทดลองค้นหาค่า Short MA "
-   "และ Long MA ที่ให้ผล Backtest ดี"
-)
-population_size = st.slider(
-   "Population Size",
-   min_value=10,
-   max_value=50,
-   value=20,
-   step=5
-)
-generations = st.slider(
-   "จำนวน Generations",
-   min_value=3,
-   max_value=20,
-   value=5
-)
-if st.button("เริ่ม Genetic Algorithm"):
-   try:
-       # โหลดข้อมูลราคา
-       prices = yf.download(
-           symbol,
-           period=period,
-           auto_adjust=True,
-           progress=False
-       )
-       if prices.empty:
-           st.error("ไม่พบข้อมูลราคาหุ้น")
-       else:
-           if isinstance(prices.columns, pd.MultiIndex):
-               prices.columns = prices.columns.get_level_values(0)
-           close = prices["Close"].dropna()
-           if len(close) < 30:
-               st.error("ข้อมูลน้อยเกินไปสำหรับการ Optimize")
-           else:
-               # Fitness: ผลตอบแทนสะสม หักค่าปรับจาก Max Drawdown
-               def evaluate_strategy(short_ma, long_ma):
-                   if short_ma >= long_ma:
-                       return -1e9, None
-                   short_avg = close.rolling(short_ma).mean()
-                   long_avg = close.rolling(long_ma).mean()
-                   signal = (short_avg > long_avg).astype(int)
-                   position = signal.shift(1).fillna(0)
-                   returns = close.pct_change().fillna(0)
-                   strategy_returns = position * returns
-                   equity = (1 + strategy_returns).cumprod()
-                   total_return = equity.iloc[-1] - 1
-                   drawdown = equity / equity.cummax() - 1
-                   max_drawdown = abs(drawdown.min())
-                   # คะแนนนี้เป็นเกณฑ์ทดลอง ไม่ใช่การรับประกันกำไร
-                   fitness = total_return - 0.5 * max_drawdown
-                   return fitness, {
-                       "Short MA": short_ma,
-                       "Long MA": long_ma,
-                       "Return (%)": total_return * 100,
-                       "Max Drawdown (%)": max_drawdown * 100,
-                       "Fitness": fitness
-                   }
-               # Encoding + Generate: chromosome = [short, long]
-               population = []
-               while len(population) < population_size:
-                   short_ma = random.randint(2, 20)
-                   long_ma = random.randint(21, 100)
-                   if short_ma < long_ma:
-                       population.append([short_ma, long_ma])
-               history = []
-               progress = st.progress(0)
-               status = st.empty()
-               for generation in range(generations):
-                   scored = []
-                   for chromosome in population:
-                       fitness, details = evaluate_strategy(
-                           chromosome[0],
-                           chromosome[1]
-                       )
-                       if details is not None:
-                           scored.append((fitness, chromosome, details))
-                   if not scored:
-                       st.error("ไม่สามารถประเมินประชากรได้")
-                       break
-                   scored.sort(key=lambda item: item[0], reverse=True)
-                   best_fitness, best_chromosome, best_details = scored[0]
-                   history.append({
-                       "Generation": generation + 1,
-                       "Best Fitness": best_fitness,
-                       "Best Short MA": best_chromosome[0],
-                       "Best Long MA": best_chromosome[1]
-                   })
-                   status.write(
-                       f"กำลังประเมิน Generation "
-                       f"{generation + 1}/{generations}"
-                   )
-                   progress.progress((generation + 1) / generations)
-                   # Selection: เลือกกลุ่มคะแนนสูงเป็นพ่อแม่
-                   parent_pool = [
-                       item[1] for item in scored[:max(2, len(scored) // 2)]
-                   ]
-                   new_population = [best_chromosome.copy()]
-                   while len(new_population) < population_size:
-                       parent1 = random.choice(parent_pool)
-                       parent2 = random.choice(parent_pool)
-                       # Crossover: ผสม Gene ของพ่อแม่
-                       child = [
-                           parent1[0],
-                           parent2[1]
-                       ]
-                       # Mutation: สุ่มเปลี่ยน Gene บางตัว
-                       if random.random() < 0.2:
-                           child[0] = random.randint(2, 20)
-                       if random.random() < 0.2:
-                           child[1] = random.randint(21, 100)
-                       if child[0] < child[1]:
-                           new_population.append(child)
-                   population = new_population
-               if history:
-                   st.success("Genetic Algorithm ทำงานเสร็จแล้ว")
-                   final_scored = [
-                       (evaluate_strategy(ch[0], ch[1])[0], ch)
-                       for ch in population
-                   ]
-                   final_scored.sort(
-                       key=lambda item: item[0],
-                       reverse=True
-                   )
-                   # เลือกผลดีที่สุดจากประชากรรุ่นสุดท้าย
-                   _, best = final_scored[0]
-                   _, best_result = evaluate_strategy(best[0], best[1])
-                   st.subheader("กลยุทธ์ที่ได้จากการ Optimize")
-                   col1, col2, col3 = st.columns(3)
-                   col1.metric("Short MA", best[0])
-                   col2.metric("Long MA", best[1])
-                   col3.metric(
-                       "Return (%)",
-                       f"{best_result['Return (%)']:.2f}%"
-                   )
-                   st.subheader("ผลลัพธ์แต่ละ Generation")
-                   history_df = pd.DataFrame(history)
-                   st.line_chart(
-                       history_df.set_index("Generation")["Best Fitness"]
-                   )
-                   st.dataframe(history_df, use_container_width=True)
-                   st.caption(
-                       "ผลนี้เป็นการทดลองกับข้อมูลย้อนหลังชุดเดียว "
-                       "ยังไม่ใช่หลักฐานว่ากลยุทธ์จะทำกำไรในอนาคต"
-                   )
-   except Exception as e:
-       st.error(f"Genetic Algorithm ทำงานไม่สำเร็จ: {e}")
-# 6. Initial Population Demo
-st.divider()
-st.header("6. Initial Population")
-st.write(
-   "สุ่มสร้างชุดค่า Moving Average "
-   "เพื่อใช้เป็นประชากรเริ่มต้นของ Genetic Algorithm"
-)
-population_size_demo = st.slider(
-   "จำนวน Chromosomes",
-   min_value=5,
-   max_value=20,
-   value=10,
-   key="population_size_demo"
-)
-if st.button("สร้าง Initial Population"):
-   random.seed()
-   initial_population = []
-   for i in range(population_size_demo):
-       short_ma = random.randint(2, 20)
-       long_ma = random.randint(21, 100)
-       initial_population.append({
-           "Chromosome": i + 1,
-           "Short MA": short_ma,
-           "Long MA": long_ma
-       })
-   st.session_state["initial_population"] = initial_population
-if "initial_population" in st.session_state:
-   st.dataframe(
-       st.session_state["initial_population"],
-       use_container_width=True,
-       hide_index=True
-   )
-   st.caption(
-       "แต่ละ Chromosome แทนชุดพารามิเตอร์ "
-       "Short MA และ Long MA ที่ GA สามารถนำไปประเมิน Fitness ได้"
-   )
-# 7. Fitness Evaluation
-st.divider()
-st.header("7. Fitness Evaluation")
-st.write(
-   "ประเมิน Chromosome แต่ละตัวจากผลตอบแทน "
-   "ของกลยุทธ์ Moving Average บนข้อมูลหุ้น"
-)
-fitness_symbol = st.text_input(
-   "Ticker สำหรับประเมิน Fitness",
-   value="AAPL",
-   key="fitness_symbol"
-)
-if st.button("ประเมิน Fitness"):
-   try:
-       fitness_data = yf.download(
-           fitness_symbol,
-           period="1y",
-           auto_adjust=True,
-           progress=False
-       )
-       if fitness_data.empty:
-           st.error("ไม่พบข้อมูลหุ้น กรุณาตรวจสอบ Ticker")
-       else:
-           fitness_close = fitness_data["Close"]
-           # รองรับข้อมูลที่มี MultiIndex
-           if isinstance(fitness_close, pd.DataFrame):
-               fitness_close = fitness_close.iloc[:, 0]
-           fitness_close = fitness_close.dropna()
-           population = st.session_state.get(
-               "initial_population", []
-           )
-           if len(population) == 0:
-               st.warning(
-                   "กรุณากดสร้าง Initial Population "
-                   "ในขั้นที่ 6 ก่อน"
-               )
-           else:
-               fitness_results = []
-               for chromosome in population:
-                   short_ma = chromosome["Short MA"]
-                   long_ma = chromosome["Long MA"]
-                   short_line = fitness_close.rolling(
-                       short_ma
-                   ).mean()
-                   long_line = fitness_close.rolling(
-                       long_ma
-                   ).mean()
-                   signal = (short_line > long_line).astype(int)
-                   position = signal.shift(1).fillna(0)
-                   daily_returns = fitness_close.pct_change().fillna(0)
-                   strategy_returns = position * daily_returns
-                   equity = (1 + strategy_returns).cumprod()
-                   total_return = (equity.iloc[-1] - 1) * 100
-                   peak = equity.cummax()
-                   drawdown = (equity / peak) - 1
-                   max_drawdown = abs(drawdown.min()) * 100
-                   # Fitness: ผลตอบแทนหักค่าปรับความเสี่ยง
-                   fitness = total_return - (0.5 * max_drawdown)
-                   fitness_results.append({
-                       "Chromosome": chromosome["Chromosome"],
-                       "Short MA": short_ma,
-                       "Long MA": long_ma,
-                       "Return (%)": round(total_return, 2),
-                       "Max Drawdown (%)": round(max_drawdown, 2),
-                       "Fitness": round(fitness, 2)
-                   })
-               results_df = pd.DataFrame(fitness_results)
-               results_df = results_df.sort_values(
-                   "Fitness", ascending=False
-               ).reset_index(drop=True)
-               st.session_state["fitness_results"] = results_df
-               st.success("ประเมิน Fitness เรียบร้อยแล้ว")
-               st.dataframe(
-                   results_df,
-                   use_container_width=True,
-                   hide_index=True
-               )
-               best = results_df.iloc[0]
-               st.subheader("Best Chromosome")
-               st.write(f"Short MA: {int(best['Short MA'])}")
-               st.write(f"Long MA: {int(best['Long MA'])}")
-               st.write(f"Return: {best['Return (%)']}%")
-               st.write(f"Max Drawdown: {best['Max Drawdown (%)']}%")
-               st.write(f"Fitness: {best['Fitness']}")
-   except Exception as e:
-       st.error(f"เกิดข้อผิดพลาด: {e}")
-# 8. Selection
-st.divider()
-st.header("8. Selection - การคัดเลือก")
-st.write(
-   "คัดเลือก Chromosomes ที่มี Fitness สูงที่สุด "
-   "เพื่อใช้เป็นพ่อแม่ในกระบวนการ Crossover"
-)
-if st.button("เริ่ม Selection"):
-   fitness_results = st.session_state.get("fitness_results")
-   if fitness_results is None or fitness_results.empty:
-       st.warning(
-           "กรุณาสร้าง Initial Population "
-           "และประเมิน Fitness ก่อน"
-       )
-   else:
-       # เลือกครึ่งหนึ่งที่มี Fitness สูงสุด
-       number_selected = max(2, len(fitness_results) // 2)
-       selected = (
-           fitness_results
-           .sort_values("Fitness", ascending=False)
-           .head(number_selected)
-           .copy()
-       )
-       st.session_state["selected_population"] = selected
-       st.success(
-           f"Selection สำเร็จ: เลือก {len(selected)} Chromosomes"
-       )
-       st.dataframe(
-           selected,
-           use_container_width=True,
-           hide_index=True
-       )
-       st.write("Chromosomes ที่ได้รับเลือกจะถูกนำไปใช้ในขั้น Crossover")
-# 9. Crossover
-st.divider()
-st.header("9. Crossover - การผสมพันธุ์")
-st.write(
-   "นำยีนจากพ่อแม่ 2 ตัวมาผสมกัน "
-   "เพื่อสร้าง Chromosome รุ่นลูก"
-)
-if st.button("เริ่ม Crossover"):
-   selected = st.session_state.get("selected_population")
-   if selected is None or len(selected) < 2:
-       st.warning("กรุณาทำ Selection ให้สำเร็จก่อน")
-   else:
-       parents = selected.to_dict("records")
-       offspring = []
-       # สร้างลูกให้มีจำนวนเท่ากับพ่อแม่ที่ถูกเลือก
-       for i in range(len(parents)):
-           parent1 = random.choice(parents)
-           parent2 = random.choice(parents)
-           child_short = int(parent1["Short MA"])
-           child_long = int(parent2["Long MA"])
-           offspring.append({
-               "Offspring": i + 1,
-               "Parent 1 Short MA": int(parent1["Short MA"]),
-               "Parent 1 Long MA": int(parent1["Long MA"]),
-               "Parent 2 Short MA": int(parent2["Short MA"]),
-               "Parent 2 Long MA": int(parent2["Long MA"]),
-               "Child Short MA": child_short,
-               "Child Long MA": child_long
-           })
-       offspring_df = pd.DataFrame(offspring)
-       st.session_state["offspring_population"] = offspring_df
-       st.success(f"Crossover สำเร็จ: สร้างลูก {len(offspring_df)} ตัว")
-       st.dataframe(
-           offspring_df,
-           use_container_width=True,
-           hide_index=True
-       )
-# 10. Mutation
-st.divider()
-st.header("10. Mutation - การกลายพันธุ์")
-st.write(
-   "สุ่มเปลี่ยนยีนบางค่าใน Offspring "
-   "เพื่อเพิ่มความหลากหลายของประชากร"
-)
-mutation_rate = st.slider(
-   "Mutation Rate",
-   min_value=0.0,
-   max_value=1.0,
-   value=0.2,
-   step=0.1,
-   key="mutation_rate"
-)
-if st.button("เริ่ม Mutation"):
-   offspring_df = st.session_state.get("offspring_population")
-   if offspring_df is None or offspring_df.empty:
-       st.warning("กรุณาทำ Crossover ให้สำเร็จก่อน")
-   else:
-       mutated = []
-       for _, row in offspring_df.iterrows():
-           old_short = int(row["Child Short MA"])
-           old_long = int(row["Child Long MA"])
-           new_short = old_short
-           new_long = old_long
-           short_changed = random.random() < mutation_rate
-           long_changed = random.random() < mutation_rate
-           if short_changed:
-               new_short = random.randint(2, 20)
-           if long_changed:
-               new_long = random.randint(21, 100)
-           mutated.append({
-               "Offspring": int(row["Offspring"]),
-               "Short MA Before": old_short,
-               "Long MA Before": old_long,
-               "Short MA After": new_short,
-               "Long MA After": new_long,
-               "Short Mutated": short_changed,
-               "Long Mutated": long_changed
-           })
-       mutated_df = pd.DataFrame(mutated)
-       st.session_state["mutated_population"] = mutated_df
-       st.success("Mutation สำเร็จ")
-       st.dataframe(
-           mutated_df,
-           use_container_width=True,
-           hide_index=True
-       )
-       changed_count = sum(
-           item["Short Mutated"] or item["Long Mutated"]
-           for item in mutated
-       )
-       st.write(
-           f"มี Offspring ที่ถูกเปลี่ยนอย่างน้อย 1 ยีน "
-           f"{changed_count} จาก {len(mutated)} ตัว"
-       )
-# 11. New Generation Evaluation
-st.divider()
-st.header("11. New Generation Evaluation")
-st.write(
-   "ประเมิน Fitness ของ Offspring หลังผ่าน Crossover และ Mutation"
-)
-if st.button("ประเมินประชากรรุ่นใหม่"):
-   mutated_df = st.session_state.get("mutated_population")
-   if mutated_df is None or mutated_df.empty:
-       st.warning("กรุณาทำ Mutation ให้สำเร็จก่อน")
-   else:
-       try:
-           new_data = yf.download(
-               fitness_symbol,
-               period="1y",
-               auto_adjust=True,
-               progress=False
-           )
-           if new_data.empty:
-               st.error("ไม่พบข้อมูลหุ้น กรุณาตรวจสอบ Ticker")
-           else:
-               new_close = new_data["Close"]
-               if isinstance(new_close, pd.DataFrame):
-                   new_close = new_close.iloc[:, 0]
-               new_close = new_close.dropna()
-               new_results = []
-               for _, row in mutated_df.iterrows():
-                   short_ma = int(row["Short MA After"])
-                   long_ma = int(row["Long MA After"])
-                   short_line = new_close.rolling(short_ma).mean()
-                   long_line = new_close.rolling(long_ma).mean()
-                   signal = (short_line > long_line).astype(int)
-                   position = signal.shift(1).fillna(0)
-                   daily_returns = new_close.pct_change().fillna(0)
-                   strategy_returns = position * daily_returns
-                   equity = (1 + strategy_returns).cumprod()
-                   total_return = (equity.iloc[-1] - 1) * 100
-                   peak = equity.cummax()
-                   drawdown = equity / peak - 1
-                   max_drawdown = abs(drawdown.min()) * 100
-                   fitness = total_return - 0.5 * max_drawdown
-                   new_results.append({
-                       "Offspring": int(row["Offspring"]),
-                       "Short MA": short_ma,
-                       "Long MA": long_ma,
-                       "Return (%)": round(total_return, 2),
-                       "Max Drawdown (%)": round(max_drawdown, 2),
-                       "Fitness": round(fitness, 2)
-                   })
-               new_df = pd.DataFrame(new_results).sort_values(
-                   "Fitness", ascending=False
-               ).reset_index(drop=True)
-               st.session_state["new_generation_results"] = new_df
-               st.success("ประเมินประชากรรุ่นใหม่เรียบร้อยแล้ว")
-               st.dataframe(
-                   new_df,
-                   use_container_width=True,
-                   hide_index=True
-               )
-               best_new = new_df.iloc[0]
-               st.subheader("Best Offspring")
-               st.write(f"Short MA: {int(best_new['Short MA'])}")
-               st.write(f"Long MA: {int(best_new['Long MA'])}")
-               st.write(f"Fitness: {best_new['Fitness']}")
-       except Exception as e:
-           st.error(f"เกิดข้อผิดพลาด: {e}")
-# 12. Genetic Algorithm Iteration
-st.divider()
-st.header("12. Genetic Algorithm Iteration")
-st.write(
-   "ค้นหาค่า Moving Average ด้วย GA จากข้อมูลฝึก "
-   "และประเมินผลกับข้อมูลทดสอบที่แยกไว้"
-)
-ga_generations = st.slider(
-   "จำนวน Generations",
-   min_value=3,
-   max_value=20,
-   value=5,
-   key="iteration_generations"
-)
-if st.button("เริ่มรัน Genetic Algorithm"):
-   try:
-       ga_data = yf.download(
-           fitness_symbol,
-           period="2y",
-           auto_adjust=True,
-           progress=False
-       )
-       if ga_data.empty:
-           st.error("ไม่พบข้อมูลหุ้น กรุณาตรวจสอบ Ticker")
-       else:
-           close = ga_data["Close"]
-           if isinstance(close, pd.DataFrame):
-               close = close.iloc[:, 0]
-           close = close.dropna()
-           if len(close) < 250:
-               st.error(
-                   "ข้อมูลราคาหุ้นไม่เพียงพอ "
-                   "กรุณาเลือกข้อมูลย้อนหลังอย่างน้อยประมาณ 1 ปี"
-               )
-           else:
-               # แบ่งข้อมูลตามเวลา: 80% ฝึก, 20% ทดสอบ
-               split_index = int(len(close) * 0.8)
-               train_close = close.iloc[:split_index]
-               test_close = close.iloc[split_index:]
-               def evaluate_strategy(prices, short_ma, long_ma):
-                   short_line = prices.rolling(short_ma).mean()
-                   long_line = prices.rolling(long_ma).mean()
-                   signal = (short_line > long_line).astype(int)
-                   position = signal.shift(1).fillna(0)
-                   daily_returns = prices.pct_change().fillna(0)
-                   strategy_returns = position * daily_returns
-                   equity = (1 + strategy_returns).cumprod()
-                   total_return = (equity.iloc[-1] - 1) * 100
-                   drawdown = equity / equity.cummax() - 1
-                   max_drawdown = abs(drawdown.min()) * 100
-                   fitness = total_return - 0.5 * max_drawdown
-                   return fitness, total_return, max_drawdown
-               # สร้างประชากรเริ่มต้น
-               population = [
-                   [
-                       random.randint(2, 20),
-                       random.randint(21, 100)
-                   ]
-                   for _ in range(20)
-               ]
-               history = []
-               best_overall = None
-               for generation in range(1, ga_generations + 1):
-                   scored_population = []
-                   for chromosome in population:
-                       fitness, ret, dd = evaluate_strategy(
-                           train_close,
-                           chromosome[0],
-                           chromosome[1]
-                       )
-                       scored_population.append({
-                           "Short MA": chromosome[0],
-                           "Long MA": chromosome[1],
-                           "Fitness": fitness,
-                           "Return (%)": ret,
-                           "Max Drawdown (%)": dd
-                       })
-                   scored_population.sort(
-                       key=lambda item: item["Fitness"],
-                       reverse=True
-                   )
-                   best = scored_population[0]
-                   history.append({
-                       "Generation": generation,
-                       "Best Short MA": best["Short MA"],
-                       "Best Long MA": best["Long MA"],
-                       "Best Fitness": round(best["Fitness"], 2),
-                       "Train Return (%)": round(
-                           best["Return (%)"], 2
-                       ),
-                       "Train Max Drawdown (%)": round(
-                           best["Max Drawdown (%)"], 2
-                       )
-                   })
-                   if (
-                       best_overall is None
-                       or best["Fitness"] > best_overall["Fitness"]
-                   ):
-                       best_overall = best.copy()
-                   # Selection: เลือกครึ่งบนของประชากร
-                   parents = scored_population[:10]
-                   # Elitism: เก็บตัวที่ดีที่สุดไว้
-                   new_population = [[
-                       best["Short MA"],
-                       best["Long MA"]
-                   ]]
-                   # Crossover + Mutation
-                   while len(new_population) < 20:
-                       parent1 = random.choice(parents)
-                       parent2 = random.choice(parents)
-                       child_short = parent1["Short MA"]
-                       child_long = parent2["Long MA"]
-                       if random.random() < 0.2:
-                           child_short = random.randint(2, 20)
-                       if random.random() < 0.2:
-                           child_long = random.randint(21, 100)
-                       new_population.append([
-                           child_short,
-                           child_long
-                       ])
-                   population = new_population
-               # ประเมิน Best Solution บนข้อมูลทดสอบ
-               test_fitness, test_return, test_drawdown = (
-                   evaluate_strategy(
-                       test_close,
-                       best_overall["Short MA"],
-                       best_overall["Long MA"]
-                   )
-               )
-               history_df = pd.DataFrame(history)
-               st.session_state["ga_iteration_history"] = history_df
-               st.session_state["ga_best_solution"] = {
-                   "Short MA": best_overall["Short MA"],
-                   "Long MA": best_overall["Long MA"],
-                   "Train Fitness": best_overall["Fitness"],
-                   "Test Fitness": test_fitness,
-                   "Test Return (%)": test_return,
-                   "Test Max Drawdown (%)": test_drawdown
-               }
-               st.success(
-                   "Genetic Algorithm ทำงานครบทุก Generation แล้ว"
-               )
-               st.subheader("Best Fitness per Generation")
-               st.line_chart(
-                   history_df.set_index("Generation")["Best Fitness"]
-               )
-               st.subheader("Generation History")
-               st.dataframe(
-                   history_df,
-                   use_container_width=True,
-                   hide_index=True
-               )
-               st.subheader("Best Solution Found")
-               col1, col2 = st.columns(2)
-               col1.metric(
-                   "Best Short MA",
-                   best_overall["Short MA"]
-               )
-               col2.metric(
-                   "Best Long MA",
-                   best_overall["Long MA"]
-               )
-               st.write(
-                   f"Training Fitness: "
-                   f"{best_overall['Fitness']:.2f}"
-               )
-               st.subheader("ผลบนข้อมูลทดสอบ")
-               col1, col2, col3 = st.columns(3)
-               col1.metric(
-                   "Test Return",
-                   f"{test_return:.2f}%"
-               )
-               col2.metric(
-                   "Test Max Drawdown",
-                   f"{test_drawdown:.2f}%"
-               )
-               col3.metric(
-                   "Test Fitness",
-                   f"{test_fitness:.2f}"
-               )
-               st.caption(
-                   "ข้อมูล 80% แรกใช้ค้นหาพารามิเตอร์ "
-                   "และข้อมูล 20% ท้ายใช้ประเมินผลเบื้องต้น "
-                   "การทดสอบนี้ยังไม่รวมค่าธรรมเนียมและ Slippage"
-               )
-   except Exception as e:
-       st.error(f"เกิดข้อผิดพลาด: {e}")
-# 13. Results Dashboard
-st.divider()
-st.header("13. Results - สรุปผลการทดลอง")
-history = st.session_state.get("ga_iteration_history")
-best_solution = st.session_state.get("ga_best_solution")
-if history is None or history.empty or best_solution is None:
-  st.info(
-       "กรุณารัน Genetic Algorithm ในขั้นที่ 12 "
-       "เพื่อสร้างผลการทดลองก่อน"
-   )
-else:
-   col1, col2, col3 = st.columns(3)
-   col1.metric(
-       "Best Short MA",
-       best_solution["Short MA"]
-   )
-   col2.metric(
-       "Best Long MA",
-       best_solution["Long MA"]
-   )
-   col3.metric(
-       "Training Fitness",
-       f"{best_solution['Train Fitness']:.2f}"
-   )
-   st.subheader("Generation History")
-   st.dataframe(
-       history,
-       use_container_width=True,
-       hide_index=True
-   )
-   st.subheader("Best Fitness per Generation")
-   st.line_chart(
-       history.set_index("Generation")["Best Fitness"]
-   )
-   st.subheader("ผลการทดสอบกับข้อมูลที่แยกไว้")
-   col1, col2, col3 = st.columns(3)
-   col1.metric(
-       "Test Return",
-       f"{best_solution['Test Return (%)']:.2f}%"
-   )
-   col2.metric(
-       "Test Max Drawdown",
-       f"{best_solution['Test Max Drawdown (%)']:.2f}%"
-   )
-   col3.metric(
-       "Test Fitness",
-       f"{best_solution['Test Fitness']:.2f}"
-   )
-   st.write(
-       f"พารามิเตอร์ที่ GA เลือก: "
-       f"Short MA = {best_solution['Short MA']}, "
-       f"Long MA = {best_solution['Long MA']}"
-   )
-   st.caption(
-       "Training Fitness ใช้สำหรับค้นหาพารามิเตอร์ "
-       "ส่วน Test Return และ Test Fitness เป็นผลจากข้อมูลทดสอบ "
-       "ผลย้อนหลังไม่รับประกันผลตอบแทนในอนาคต"
-   )
+import warnings
+from dataclasses import dataclass
 
-# 14. Strategy Comparison
-st.divider()
-st.header("14. Strategy Comparison")
-st.write(
-   "เปรียบเทียบกลยุทธ์ Moving Average ที่ GA เลือก "
-   "กับ Buy & Hold โดยใช้ข้อมูลทดสอบช่วงเดียวกัน"
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+
+st.set_page_config(page_title="Trading Strategy Optimizer", page_icon="📈", layout="wide")
+st.markdown("""
+<style>
+.block-container {padding-top: 1rem; padding-bottom: 1.2rem; max-width: 1550px;}
+div[data-testid="stMetric"] {background: rgba(90,140,180,.08); border: 1px solid rgba(120,160,190,.2); padding: 12px; border-radius: 12px;}
+.small-note {font-size: .86rem; color: #8a98a8;}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("📈 Trading Strategy Optimizer")
+st.caption("Genetic Algorithm · Technical Indicators · Backtesting · Risk-adjusted Strategy Evaluation")
+
+# ---------- Data helpers ----------
+def load_price_data(uploaded, ticker, period):
+    if uploaded is not None:
+        df = pd.read_csv(uploaded)
+        df.columns = [str(c).strip() for c in df.columns]
+        lower_map = {c.lower(): c for c in df.columns}
+        date_col = next((lower_map[k] for k in ["date", "datetime", "timestamp"] if k in lower_map), None)
+        close_col = next((lower_map[k] for k in ["close", "adj close", "adj_close", "price"] if k in lower_map), None)
+        if close_col is None:
+            raise ValueError("CSV ต้องมีคอลัมน์ Close (และควรมี Date ด้วย)")
+        if date_col:
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+            df = df.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
+        else:
+            df.index = pd.RangeIndex(start=0, stop=len(df), name="Row")
+        df["Close"] = pd.to_numeric(df[close_col], errors="coerce")
+        df = df.dropna(subset=["Close"])
+        if "Volume" not in df.columns:
+            df["Volume"] = 0
+        return df[["Close", "Volume"]].astype({"Close": float, "Volume": float})
+    if yf is None:
+        raise ValueError("ยังไม่ได้ติดตั้ง yfinance ให้รัน: python -m pip install yfinance")
+    df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+    if df.empty:
+        raise ValueError("ดาวน์โหลดข้อมูลไม่สำเร็จ ลองเปลี่ยน Ticker หรือ Period")
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    if "Close" not in df:
+        raise ValueError("ไม่พบข้อมูล Close จากแหล่งข้อมูล")
+    if "Volume" not in df:
+        df["Volume"] = 0
+    return df[["Close", "Volume"]].dropna()
+
+
+def add_indicators(df):
+    data = df.copy()
+    data["Return"] = data["Close"].pct_change().fillna(0)
+    data["RSI"] = 50.0
+    delta = data["Close"].diff()
+    gain = delta.clip(lower=0).rolling(14, min_periods=1).mean()
+    loss = -delta.clip(upper=0).rolling(14, min_periods=1).mean()
+    rs = gain / loss.replace(0, np.nan)
+    data["RSI"] = (100 - (100 / (1 + rs))).fillna(50)
+    return data
+
+
+
+def evaluate_strategy(data, fast, slow, rsi_period, rsi_buy, rsi_sell, fee_pct):
+    close = data["Close"]
+
+    fast_ma = close.rolling(int(fast), min_periods=int(fast)).mean()
+    slow_ma = close.rolling(int(slow), min_periods=int(slow)).mean()
+
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(
+        int(rsi_period), min_periods=int(rsi_period)
+    ).mean()
+    loss = -delta.clip(upper=0).rolling(
+        int(rsi_period), min_periods=int(rsi_period)
+    ).mean()
+
+    rs = gain / loss.replace(0, np.nan)
+    rsi = (100 - 100 / (1 + rs)).fillna(50)
+
+    # Buy: bullish MA trend + RSI below buy threshold
+    # Sell: bearish MA trend OR RSI above sell threshold
+    entry = (fast_ma > slow_ma) & (rsi <= rsi_buy)
+    exit_signal = (fast_ma < slow_ma) | (rsi >= rsi_sell)
+
+    # Simulate Long/Cash positions
+    position = pd.Series(0.0, index=data.index)
+    holding = 0.0
+
+    for i in range(len(data)):
+        if holding == 0 and bool(entry.iloc[i]):
+            holding = 1.0
+        elif holding == 1 and bool(exit_signal.iloc[i]):
+            holding = 0.0
+        position.iloc[i] = holding
+
+    # Execute the signal on the next bar to reduce look-ahead bias
+    position = position.shift(1).fillna(0)
+
+    trades = position.diff().abs().fillna(position.abs())
+    daily_returns = data["Close"].pct_change().fillna(0)
+
+    strategy_returns = (
+        position * daily_returns - trades * (fee_pct / 100.0)
+    )
+    equity = (1 + strategy_returns).cumprod()
+    buy_hold = (1 + daily_returns).cumprod()
+
+    total_return = float(equity.iloc[-1] - 1)
+    buy_hold_return = float(buy_hold.iloc[-1] - 1)
+
+    daily_std = float(strategy_returns.std(ddof=0))
+    sharpe = (
+        float(strategy_returns.mean() / daily_std * np.sqrt(252))
+        if daily_std > 0 else 0.0
+    )
+
+    drawdown = equity / equity.cummax() - 1
+    max_drawdown = float(drawdown.min())
+
+    # Fitness rewards return and risk-adjusted performance
+    fitness = total_return + 0.15 * sharpe + 0.5 * max_drawdown
+
+    # Approximate daily-return win rate and profit factor
+    active_returns = strategy_returns[position > 0]
+    if len(active_returns):
+        win_rate = float((active_returns > 0).mean() * 100)
+    else:
+        win_rate = 0.0
+
+    gross_profit = float(strategy_returns[strategy_returns > 0].sum())
+    gross_loss = float(-strategy_returns[strategy_returns < 0].sum())
+    profit_factor = (
+        gross_profit / gross_loss if gross_loss > 0
+        else (float("inf") if gross_profit > 0 else 0.0)
+    )
+
+    metrics = {
+        "Total Return": total_return,
+        "Buy & Hold": buy_hold_return,
+        "Sharpe Ratio": sharpe,
+        "Max Drawdown": max_drawdown,
+        "Trades": int((trades > 0).sum()),
+        "Win Rate (active days)": win_rate,
+        "Profit Factor (daily)": profit_factor,
+    }
+
+    curves = pd.DataFrame({
+        "Strategy Equity": equity,
+        "Buy & Hold Equity": buy_hold,
+        "Drawdown": drawdown,
+        "Position": position,
+        "RSI": rsi,
+        "Fast MA": fast_ma,
+        "Slow MA": slow_ma,
+    })
+
+    return fitness, metrics, curves
+
+
+
+def run_ga(
+    data, population_size, generations, crossover_rate,
+    mutation_rate, elite_count, fee_pct, seed
+):
+    rng = random.Random(seed)
+
+    # Chromosome:
+    # [Fast MA, Slow MA, RSI Period, RSI Buy, RSI Sell]
+    def random_chromosome():
+        fast = rng.randint(3, 30)
+        slow = rng.randint(max(fast + 2, 10), 100)
+        rsi_period = rng.randint(5, 30)
+        rsi_buy = rng.randint(20, 45)
+        rsi_sell = rng.randint(max(rsi_buy + 10, 55), 80)
+        return [fast, slow, rsi_period, rsi_buy, rsi_sell]
+
+    def repair(ch):
+        fast = int(np.clip(round(ch[0]), 3, 30))
+        slow = int(np.clip(round(ch[1]), max(fast + 2, 10), 100))
+        rsi_period = int(np.clip(round(ch[2]), 5, 30))
+        rsi_buy = int(np.clip(round(ch[3]), 20, 45))
+        rsi_sell = int(np.clip(round(ch[4]), max(rsi_buy + 10, 55), 80))
+
+        return [fast, slow, rsi_period, rsi_buy, rsi_sell]
+
+    cache = {}
+
+    def score(ch):
+        key = tuple(ch)
+        if key not in cache:
+            cache[key] = evaluate_strategy(
+                data,
+                fast=ch[0],
+                slow=ch[1],
+                rsi_period=ch[2],
+                rsi_buy=ch[3],
+                rsi_sell=ch[4],
+                fee_pct=fee_pct,
+            )[0]
+        return cache[key]
+
+    population = [
+        random_chromosome() for _ in range(population_size)
+    ]
+
+    history = []
+    best = None
+    best_score = -np.inf
+
+    for gen in range(1, generations + 1):
+        scored = sorted(
+            [(score(ch), ch) for ch in population],
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        if scored[0][0] > best_score:
+            best_score = scored[0][0]
+            best = scored[0][1].copy()
+
+        history.append({
+            "Generation": gen,
+            "Best Fitness": float(scored[0][0]),
+            "Average Fitness": float(
+                np.mean([value for value, _ in scored])
+            ),
+        })
+
+        # Elitism: preserve the best chromosomes
+        new_population = [
+            chromosome.copy()
+            for _, chromosome in scored[:elite_count]
+        ]
+
+        def tournament():
+            contestants = rng.sample(scored, min(3, len(scored)))
+            return max(contestants, key=lambda item: item[0])[1]
+
+        while len(new_population) < population_size:
+            parent1 = tournament().copy()
+            parent2 = tournament().copy()
+            child1, child2 = parent1.copy(), parent2.copy()
+
+            # Single-point crossover
+            if rng.random() < crossover_rate:
+                point = rng.randint(1, len(parent1) - 1)
+                child1 = parent1[:point] + parent2[point:]
+                child2 = parent2[:point] + parent1[point:]
+
+            for child in (child1, child2):
+                # Mutate individual genes
+                if rng.random() < mutation_rate:
+                    child[0] += rng.choice([-4, -2, 2, 4])
+                if rng.random() < mutation_rate:
+                    child[1] += rng.choice([-10, -5, 5, 10])
+                if rng.random() < mutation_rate:
+                    child[2] += rng.choice([-3, -1, 1, 3])
+                if rng.random() < mutation_rate:
+                    child[3] += rng.choice([-5, -2, 2, 5])
+                if rng.random() < mutation_rate:
+                    child[4] += rng.choice([-5, -2, 2, 5])
+
+                new_population.append(repair(child))
+
+                if len(new_population) >= population_size:
+                    break
+
+        population = new_population
+
+    return best, pd.DataFrame(history), best_score
+
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.header("⚙️ Experiment Setup")
+    source = st.radio("Price data source", ["Download from Yahoo Finance", "Upload CSV"], index=0)
+    uploaded = None
+    ticker, period = "AAPL", "5y"
+    if source == "Download from Yahoo Finance":
+        ticker = st.text_input("Ticker", value="AAPL", help="ตัวอย่าง AAPL, MSFT, TSLA, BTC-USD, ^GSPC")
+        period = st.selectbox("Historical period", ["1y", "2y", "5y", "10y", "max"], index=2)
+    else:
+        uploaded = st.file_uploader("Upload price data (CSV)", type=["csv"])
+    st.divider()
+    st.subheader("🧬 Genetic Algorithm")
+    population_size = st.slider("Population", 6, 40, 16, 2)
+    generations = st.slider("Generations", 3, 40, 12)
+    crossover_rate = st.slider("Crossover rate", 0.0, 1.0, 0.8, 0.05)
+    mutation_rate = st.slider("Mutation rate", 0.0, 1.0, 0.15, 0.05)
+    elite_count = st.slider("Elites", 1, 5, 2)
+    seed = st.number_input("Random seed", min_value=0, max_value=999999, value=2026)
+    st.divider()
+    fee_pct = st.number_input("Trading fee per position change (%)", min_value=0.0, max_value=2.0, value=0.1, step=0.05)
+    run_button = st.button("▶ Optimize Strategy", type="primary", use_container_width=True)
+
+# ---------- Main ----------
+if source == "Upload CSV" and uploaded is None:
+    st.info("อัปโหลดไฟล์ CSV ที่มีคอลัมน์ Close (และ Date ถ้ามี) ทางแถบด้านซ้าย หรือเปลี่ยนเป็น Yahoo Finance เพื่อโหลดข้อมูลราคา")
+    st.stop()
+try:
+    prices = load_price_data(uploaded if source == "Upload CSV" else None, ticker, period)
+    if len(prices) < 120:
+        st.warning("ข้อมูลราคามีน้อยกว่า 120 แถว ผลการ Optimize อาจไม่น่าเชื่อถือ")
+    data = add_indicators(prices)
+except Exception as exc:
+    st.error(f"โหลดข้อมูลไม่สำเร็จ: {exc}")
+    st.stop()
+
+st.markdown("### 📁 Market Data Overview")
+a, b, c, d = st.columns(4)
+a.metric("Asset / Source", ticker if source == "Download from Yahoo Finance" else "Uploaded CSV")
+b.metric("Price rows", f"{len(data):,}")
+c.metric("First close", f"{data['Close'].iloc[0]:,.2f}")
+d.metric("Latest close", f"{data['Close'].iloc[-1]:,.2f}")
+with st.expander("Preview historical prices"):
+    st.line_chart(data[["Close"]], height=220)
+    st.dataframe(data.tail(10), use_container_width=True)
+
+if "trading_result" not in st.session_state:
+    st.session_state["trading_result"] = None
+
+if run_button:
+    if elite_count >= population_size:
+        st.error("Elites ต้องน้อยกว่า Population")
+    else:
+        with st.spinner("Genetic Algorithm กำลังค้นหาค่ากลยุทธ์ที่เหมาะสม..."):
+            best, history, fitness = run_ga(data, int(population_size), int(generations), float(crossover_rate), float(mutation_rate), int(elite_count), float(fee_pct), int(seed))
+            
+            _, metrics, curves = evaluate_strategy(
+                data,
+                best[0], best[1], best[2], best[3], best[4],
+                float(fee_pct)
+            )
+
+            st.session_state["trading_result"] = {"best": best, "history": history, "fitness": fitness, "metrics": metrics, "curves": curves, "ticker": ticker if source == "Download from Yahoo Finance" else "Uploaded CSV", "fee": float(fee_pct)}
+
+result = st.session_state.get("trading_result")
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "🧬 GA Optimization", "📉 Backtesting", "⚙️ Best Strategy"])
+if result is None:
+    with tab1:
+        st.info("ตั้งค่าด้านซ้ายแล้วกด Optimize Strategy เพื่อเริ่มค้นหากลยุทธ์")
+    with tab2:
+        st.caption("GA จะใช้ Selection, Crossover, Mutation และ Elitism เพื่อค้นหาพารามิเตอร์")
+    with tab3:
+        st.caption("ผล Backtesting จะปรากฏหลัง Optimize")
+    with tab4:
+        st.caption("พารามิเตอร์กลยุทธ์ที่ดีที่สุดจะแสดงหลัง Optimize")
+else:
+    best = result["best"]
+    metrics = result["metrics"]
+    with tab1:
+        st.subheader("Optimization Summary")
+        x1, x2, x3, x4 = st.columns(4)
+        x1.metric("Strategy Return", f"{metrics['Total Return']:.2%}")
+        x2.metric("Buy & Hold Return", f"{metrics['Buy & Hold']:.2%}")
+        x3.metric("Sharpe Ratio", f"{metrics['Sharpe Ratio']:.2f}")
+        x4.metric("Maximum Drawdown", f"{metrics['Max Drawdown']:.2%}")
+        st.line_chart(result["curves"][["Strategy Equity", "Buy & Hold Equity"]], height=300)
+        st.caption("ผลจำลองจากข้อมูลในอดีต ไม่ใช่การรับประกันผลตอบแทนในอนาคต")
+    with tab2:
+        st.subheader("Fitness Progress by Generation")
+        st.line_chart(result["history"].set_index("Generation"), height=280)
+        st.dataframe(result["history"], use_container_width=True, hide_index=True)
+        st.markdown("**Best Chromosome**")
+        st.code(
+    f"[Fast MA={best[0]}, Slow MA={best[1]}, "
+    f"RSI Period={best[2]}, RSI Buy={best[3]}, "
+    f"RSI Sell={best[4]}]",
+    language="text"
 )
-comparison_symbol = st.text_input(
-   "Ticker สำหรับเปรียบเทียบ",
-   value="AAPL",
-   key="comparison_symbol"
-)
-if st.button("เปรียบเทียบกลยุทธ์"):
-   try:
-       best_solution = st.session_state.get("ga_best_solution")
-       if best_solution is None:
-           st.warning(
-               "กรุณารัน Genetic Algorithm ในขั้นที่ 12 ก่อน"
-           )
-       else:
-           comparison_data = yf.download(
-               comparison_symbol,
-               period="2y",
-               auto_adjust=True,
-               progress=False
-           )
-           if comparison_data.empty:
-               st.error(
-                   "ไม่พบข้อมูลหุ้น กรุณาตรวจสอบ Ticker"
-               )
-           else:
-               close = comparison_data["Close"]
-               if isinstance(close, pd.DataFrame):
-                   close = close.iloc[:, 0]
-               close = close.dropna()
-               if len(close) < 250:
-                   st.error(
-                       "ข้อมูลราคาหุ้นไม่เพียงพอสำหรับการเปรียบเทียบ"
-                   )
-               else:
-                   # แบ่งช่วงข้อมูลเหมือนกับขั้นที่ 12
-                   split_index = int(len(close) * 0.8)
-                   test_start = close.index[split_index]
-                   short_ma = int(best_solution["Short MA"])
-                   long_ma = int(best_solution["Long MA"])
-                   short_line = close.rolling(short_ma).mean()
-                   long_line = close.rolling(long_ma).mean()
-                   signal = (short_line > long_line).astype(int)
-                   position = signal.shift(1).fillna(0)
-                   daily_returns = close.pct_change().fillna(0)
-                   # ใช้ผลตอบแทนเฉพาะช่วงทดสอบ
-                   test_returns = daily_returns.loc[test_start:]
-                   test_position = position.loc[test_start:]
-                   strategy_returns = (
-                       test_position * test_returns
-                   )
-                   strategy_equity = (
-                       1 + strategy_returns
-                   ).cumprod()
-                   buy_hold_equity = (
-                       1 + test_returns
-                   ).cumprod()
-                   strategy_return = (
-                       strategy_equity.iloc[-1] - 1
-                   ) * 100
-                   buy_hold_return = (
-                       buy_hold_equity.iloc[-1] - 1
-                   ) * 100
-                   comparison_df = pd.DataFrame({
-                       "GA Moving Average": strategy_equity,
-                       "Buy & Hold": buy_hold_equity
-                   })
-                   st.subheader(
-                       "Cumulative Performance - Test Period"
-                   )
-                   st.line_chart(comparison_df)
-                   col1, col2 = st.columns(2)
-                   col1.metric(
-                       "GA Strategy Return",
-                       f"{strategy_return:.2f}%"
-                   )
-                   col2.metric(
-                       "Buy & Hold Return",
-                       f"{buy_hold_return:.2f}%"
-                   )
-                   st.write(
-                       f"Short MA = {short_ma} | "
-                       f"Long MA = {long_ma}"
-                   )
-                   st.caption(
-                       "เปรียบเทียบในช่วงข้อมูลทดสอบเดียวกัน "
-                       "โดยใช้พารามิเตอร์ที่ GA เลือกจากข้อมูลฝึก "
-                       "ผลยังไม่รวมค่าธรรมเนียมและ Slippage "
-                       "และไม่รับประกันผลตอบแทนในอนาคต"
-                   )
-   except Exception as e:
-       st.error(f"เกิดข้อผิดพลาด: {e}")
+        st.caption("Chromosome = ชุดพารามิเตอร์ของกลยุทธ์; Fitness ให้คะแนนจากผลตอบแทน, Sharpe Ratio และการหักโทษ Maximum Drawdown")
+    with tab3:
+        st.subheader("Backtesting Performance")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Return", f"{metrics['Total Return']:.2%}")
+        m2.metric("Trades / position changes", f"{metrics['Trades']}")
+        m3.metric("Max Drawdown", f"{metrics['Max Drawdown']:.2%}")
+        st.line_chart(result["curves"][["Strategy Equity", "Buy & Hold Equity"]], height=300)
+        
+        st.subheader("📊 Risk & Trade Statistics")
+
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Win Rate (active days)", f"{metrics['Win Rate (active days)']:.2f}%")
+        r2.metric(
+            "Profit Factor (daily)",
+            f"{metrics['Profit Factor (daily)']:.2f}"
+            if np.isfinite(metrics["Profit Factor (daily)"])
+            else "∞"
+        )
+        r3.metric("Number of Position Changes", f"{metrics['Trades']}")
+
+        st.subheader("📈 Technical Indicators")
+        st.line_chart(result["curves"][["Fast MA", "Slow MA"]], height=220)
+        st.line_chart(result["curves"][["RSI"]], height=180)
+
+        st.subheader("⬇️ Export Results")
+
+        st.download_button(
+            "Download Backtest Results (CSV)",
+            data=result["curves"].to_csv(index=True).encode("utf-8-sig"),
+            file_name="trading_backtest_results.csv",
+            mime="text/csv",
+        )
+
+        st.download_button(
+            "Download Fitness History (CSV)",
+            data=result["history"].to_csv(index=False).encode("utf-8-sig"),
+            file_name="ga_fitness_history.csv",
+            mime="text/csv",
+        )
+
+        strategy_params = pd.DataFrame([{
+            "Fast MA": best[0],
+            "Slow MA": best[1],
+            "RSI Period": best[2],
+            "RSI Buy": best[3],
+            "RSI Sell": best[4],
+            "Fitness": result["fitness"],
+        }])
+
+        st.download_button(
+            "Download Best Strategy (CSV)",
+            data=strategy_params.to_csv(index=False).encode("utf-8-sig"),
+            file_name="best_trading_strategy.csv",
+            mime="text/csv",
+        )
+
+
+
+        st.dataframe(pd.DataFrame({"Metric": list(metrics.keys()), "Value": list(metrics.values())}), use_container_width=True, hide_index=True)
+    with tab4:
+       
+        st.subheader("Optimized Trading Rules")
+        p1, p2, p3, p4, p5 = st.columns(5)
+
+        p1.metric("Fast MA", f"{best[0]} days")
+        p2.metric("Slow MA", f"{best[1]} days")
+        p3.metric("RSI Period", f"{best[2]} days")
+        p4.metric("RSI Buy", f"{best[3]}")
+        p5.metric("RSI Sell", f"{best[4]}")
+
+        st.markdown("**Rule interpretation**")
+        st.write(
+            f"- เปิดสถานะ Long เมื่อ Fast MA ({best[0]}) "
+            f"สูงกว่า Slow MA ({best[1]}) และ RSI ({best[2]} วัน) "
+            f"ต่ำกว่าหรือเท่ากับ {best[3]}."
+        )
+        st.write(
+            f"- ปิดสถานะเมื่อ Fast MA ต่ำกว่า Slow MA "
+            f"หรือ RSI สูงกว่าหรือเท่ากับ {best[4]}."
+        )
+        st.write(
+            f"- คิดค่าธรรมเนียม {result['fee']:.2f}% "
+            f"ต่อการเปลี่ยนสถานะหนึ่งครั้ง"
+        )
+        st.warning(
+            "นี่คือโปรโตไทป์เพื่อการศึกษา กลยุทธ์นี้เป็น Long/Cash เท่านั้น "
+            "และยังไม่รวม slippage, ภาษี, การส่งคำสั่งจริง "
+            "หรือการป้องกัน overfitting"
+        )
+
+
+st.markdown("---")
+st.caption("Trading Strategy Optimizer | Genetic Algorithm for strategy parameter search · Historical backtest only")
