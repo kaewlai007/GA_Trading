@@ -73,107 +73,112 @@ def add_indicators(df):
 
 
 
-def evaluate_strategy(data, fast, slow, rsi_period, rsi_buy, rsi_sell, fee_pct):
+def evaluate_strategy(data, fast, slow, rsi_period, rsi_buy, rsi_sell, fee_pct,
+                      indicator="SMA + RSI", direction="Long"):
     close = data["Close"]
+    fast = int(fast)
+    slow = int(slow)
+    rsi_period = int(rsi_period)
 
-    fast_ma = close.rolling(int(fast), min_periods=int(fast)).mean()
-    slow_ma = close.rolling(int(slow), min_periods=int(slow)).mean()
+    sma_fast = close.rolling(fast, min_periods=fast).mean()
+    sma_slow = close.rolling(slow, min_periods=slow).mean()
+    ema_fast = close.ewm(span=fast, adjust=False, min_periods=fast).mean()
+    ema_slow = close.ewm(span=slow, adjust=False, min_periods=slow).mean()
 
     delta = close.diff()
-    gain = delta.clip(lower=0).rolling(
-        int(rsi_period), min_periods=int(rsi_period)
-    ).mean()
-    loss = -delta.clip(upper=0).rolling(
-        int(rsi_period), min_periods=int(rsi_period)
-    ).mean()
-
+    gain = delta.clip(lower=0).rolling(rsi_period, min_periods=rsi_period).mean()
+    loss = -delta.clip(upper=0).rolling(rsi_period, min_periods=rsi_period).mean()
     rs = gain / loss.replace(0, np.nan)
     rsi = (100 - 100 / (1 + rs)).fillna(50)
 
-    # Buy: bullish MA trend + RSI below buy threshold
-    # Sell: bearish MA trend OR RSI above sell threshold
-    entry = (fast_ma > slow_ma) & (rsi <= rsi_buy)
-    exit_signal = (fast_ma < slow_ma) | (rsi >= rsi_sell)
+    macd_line = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+    macd_signal = macd_line.ewm(span=rsi_period, adjust=False).mean()
+    bb_mid = close.rolling(slow, min_periods=slow).mean()
+    bb_std = close.rolling(slow, min_periods=slow).std()
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
 
-    # Simulate Long/Cash positions
+    # Build indicator-specific entry/exit signals.
+    if indicator == "SMA Crossover":
+        long_entry, long_exit = (sma_fast > sma_slow), (sma_fast < sma_slow)
+        short_entry, short_exit = (sma_fast < sma_slow), (sma_fast > sma_slow)
+    elif indicator == "EMA Crossover":
+        long_entry, long_exit = (ema_fast > ema_slow), (ema_fast < ema_slow)
+        short_entry, short_exit = (ema_fast < ema_slow), (ema_fast > ema_slow)
+    elif indicator == "RSI":
+        long_entry, long_exit = (rsi <= rsi_buy), (rsi >= rsi_sell)
+        short_entry, short_exit = (rsi >= rsi_sell), (rsi <= rsi_buy)
+    elif indicator == "MACD":
+        long_entry, long_exit = (macd_line > macd_signal), (macd_line < macd_signal)
+        short_entry, short_exit = (macd_line < macd_signal), (macd_line > macd_signal)
+    elif indicator == "Bollinger Bands":
+        long_entry, long_exit = (close < bb_lower), (close > bb_mid)
+        short_entry, short_exit = (close > bb_upper), (close < bb_mid)
+    else:  # combined SMA + RSI strategy (original behavior)
+        long_entry = (sma_fast > sma_slow) & (rsi <= rsi_buy)
+        long_exit = (sma_fast < sma_slow) | (rsi >= rsi_sell)
+        short_entry = (sma_fast < sma_slow) & (rsi >= rsi_sell)
+        short_exit = (sma_fast > sma_slow) | (rsi <= rsi_buy)
+
     position = pd.Series(0.0, index=data.index)
     holding = 0.0
-
     for i in range(len(data)):
-        if holding == 0 and bool(entry.iloc[i]):
-            holding = 1.0
-        elif holding == 1 and bool(exit_signal.iloc[i]):
-            holding = 0.0
+        le = bool(long_entry.iloc[i]) if pd.notna(long_entry.iloc[i]) else False
+        lx = bool(long_exit.iloc[i]) if pd.notna(long_exit.iloc[i]) else False
+        se = bool(short_entry.iloc[i]) if pd.notna(short_entry.iloc[i]) else False
+        sx = bool(short_exit.iloc[i]) if pd.notna(short_exit.iloc[i]) else False
+        if holding == 0:
+            if direction in ("Long", "Both") and le:
+                holding = 1.0
+            elif direction in ("Short", "Both") and se:
+                holding = -1.0
+        elif holding > 0 and (lx or (direction == "Short" and se)):
+            holding = -1.0 if direction == "Both" and se else 0.0
+        elif holding < 0 and (sx or (direction == "Long" and le)):
+            holding = 1.0 if direction == "Both" and le else 0.0
         position.iloc[i] = holding
 
-    # Execute the signal on the next bar to reduce look-ahead bias
+    # Execute signal on next bar to reduce look-ahead bias.
     position = position.shift(1).fillna(0)
-
     trades = position.diff().abs().fillna(position.abs())
-    daily_returns = data["Close"].pct_change().fillna(0)
-
-    strategy_returns = (
-        position * daily_returns - trades * (fee_pct / 100.0)
-    )
+    daily_returns = close.pct_change().fillna(0)
+    strategy_returns = position * daily_returns - trades * (fee_pct / 100.0)
     equity = (1 + strategy_returns).cumprod()
     buy_hold = (1 + daily_returns).cumprod()
 
     total_return = float(equity.iloc[-1] - 1)
     buy_hold_return = float(buy_hold.iloc[-1] - 1)
-
     daily_std = float(strategy_returns.std(ddof=0))
-    sharpe = (
-        float(strategy_returns.mean() / daily_std * np.sqrt(252))
-        if daily_std > 0 else 0.0
-    )
-
+    sharpe = float(strategy_returns.mean() / daily_std * np.sqrt(252)) if daily_std > 0 else 0.0
     drawdown = equity / equity.cummax() - 1
     max_drawdown = float(drawdown.min())
-
-    # Fitness rewards return and risk-adjusted performance
     fitness = total_return + 0.15 * sharpe + 0.5 * max_drawdown
 
-    # Approximate daily-return win rate and profit factor
-    active_returns = strategy_returns[position > 0]
-    if len(active_returns):
-        win_rate = float((active_returns > 0).mean() * 100)
-    else:
-        win_rate = 0.0
-
+    active_returns = strategy_returns[position != 0]
+    win_rate = float((active_returns > 0).mean() * 100) if len(active_returns) else 0.0
     gross_profit = float(strategy_returns[strategy_returns > 0].sum())
     gross_loss = float(-strategy_returns[strategy_returns < 0].sum())
-    profit_factor = (
-        gross_profit / gross_loss if gross_loss > 0
-        else (float("inf") if gross_profit > 0 else 0.0)
-    )
-
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
     metrics = {
-        "Total Return": total_return,
-        "Buy & Hold": buy_hold_return,
-        "Sharpe Ratio": sharpe,
-        "Max Drawdown": max_drawdown,
-        "Trades": int((trades > 0).sum()),
-        "Win Rate (active days)": win_rate,
+        "Total Return": total_return, "Buy & Hold": buy_hold_return,
+        "Sharpe Ratio": sharpe, "Max Drawdown": max_drawdown,
+        "Trades": int((trades > 0).sum()), "Win Rate (active days)": win_rate,
         "Profit Factor (daily)": profit_factor,
     }
-
     curves = pd.DataFrame({
-        "Strategy Equity": equity,
-        "Buy & Hold Equity": buy_hold,
-        "Drawdown": drawdown,
-        "Position": position,
-        "RSI": rsi,
-        "Fast MA": fast_ma,
-        "Slow MA": slow_ma,
+        "Strategy Equity": equity, "Buy & Hold Equity": buy_hold,
+        "Drawdown": drawdown, "Position": position, "RSI": rsi,
+        "Fast MA": sma_fast, "Slow MA": sma_slow,
+        "Fast EMA": ema_fast, "Slow EMA": ema_slow,
+        "MACD": macd_line, "MACD Signal": macd_signal,
+        "BB Upper": bb_upper, "BB Middle": bb_mid, "BB Lower": bb_lower,
     })
-
     return fitness, metrics, curves
-
 
 
 def run_ga(
     data, population_size, generations, crossover_rate,
-    mutation_rate, elite_count, fee_pct, seed
+    mutation_rate, elite_count, fee_pct, seed, indicator, direction
 ):
     rng = random.Random(seed)
 
@@ -208,7 +213,7 @@ def run_ga(
                 rsi_period=ch[2],
                 rsi_buy=ch[3],
                 rsi_sell=ch[4],
-                fee_pct=fee_pct,
+                fee_pct=fee_pct, indicator=indicator, direction=direction,
             )[0]
         return cache[key]
 
@@ -294,6 +299,25 @@ with st.sidebar:
     else:
         uploaded = st.file_uploader("Upload price data (CSV)", type=["csv"])
     st.divider()
+    st.subheader("📊 Trading Strategy")
+    indicators = st.multiselect(
+        "Select Indicator(s)",
+        ["SMA + RSI", "SMA Crossover", "EMA Crossover", "RSI", "MACD", "Bollinger Bands"],
+        default=["SMA + RSI"],
+        help="เลือกหนึ่งตัวเพื่อทดลองเดี่ยว หรือหลายตัวเพื่อให้ GA ทดลองแต่ละ Indicator แยกกัน แล้วเปรียบเทียบคะแนน"
+    )
+    if not indicators:
+        st.warning("กรุณาเลือกอย่างน้อยหนึ่ง Indicator")
+        indicators = ["SMA + RSI"]
+    direction = st.selectbox(
+        "Trading Direction", ["Long", "Short", "Both"], index=0,
+        help="Long = ซื้อแล้วถือ, Short = ขายชอร์ต, Both = ใช้ได้ทั้งสองฝั่ง"
+    )
+    st.caption(
+        "GA ค้นหาพารามิเตอร์ใน chromosome 5 ค่า; แต่ละ Indicator ใช้เฉพาะพารามิเตอร์ที่เกี่ยวข้อง "
+        "ค่าบางตัวจึงอาจไม่ส่งผลต่อสัญญาณของ Indicator ที่เลือก"
+    )
+    st.divider()
     st.subheader("🧬 Genetic Algorithm")
     population_size = st.slider("Population", 6, 40, 16, 2)
     generations = st.slider("Generations", 3, 40, 12)
@@ -318,6 +342,23 @@ except Exception as exc:
     st.error(f"โหลดข้อมูลไม่สำเร็จ: {exc}")
     st.stop()
 
+st.markdown("### 📅 Backtest Date Range")
+if isinstance(data.index, pd.DatetimeIndex):
+    min_date = data.index.min().date()
+    max_date = data.index.max().date()
+    date_cols = st.columns(2)
+    start_date = date_cols[0].date_input("Start Date", value=min_date, min_value=min_date, max_value=max_date)
+    end_date = date_cols[1].date_input("End Date", value=max_date, min_value=min_date, max_value=max_date)
+    if start_date > end_date:
+        st.error("Start Date ต้องไม่อยู่หลัง End Date")
+        st.stop()
+    data = data.loc[(data.index.date >= start_date) & (data.index.date <= end_date)].copy()
+    if len(data) < 30:
+        st.warning("ช่วงวันที่ที่เลือกมีข้อมูลน้อยกว่า 30 แถว ผล Backtest อาจไม่น่าเชื่อถือ")
+else:
+    st.caption("ไฟล์ CSV ไม่มีคอลัมน์วันที่ จึงใช้ลำดับแถวทั้งหมดเป็นช่วงข้อมูล")
+    start_date, end_date = None, None
+
 st.markdown("### 📁 Market Data Overview")
 a, b, c, d = st.columns(4)
 a.metric("Asset / Source", ticker if source == "Download from Yahoo Finance" else "Uploaded CSV")
@@ -335,16 +376,42 @@ if run_button:
     if elite_count >= population_size:
         st.error("Elites ต้องน้อยกว่า Population")
     else:
-        with st.spinner("Genetic Algorithm กำลังค้นหาค่ากลยุทธ์ที่เหมาะสม..."):
-            best, history, fitness = run_ga(data, int(population_size), int(generations), float(crossover_rate), float(mutation_rate), int(elite_count), float(fee_pct), int(seed))
-            
-            _, metrics, curves = evaluate_strategy(
-                data,
-                best[0], best[1], best[2], best[3], best[4],
-                float(fee_pct)
-            )
-
-            st.session_state["trading_result"] = {"best": best, "history": history, "fitness": fitness, "metrics": metrics, "curves": curves, "ticker": ticker if source == "Download from Yahoo Finance" else "Uploaded CSV", "fee": float(fee_pct)}
+        with st.spinner("Genetic Algorithm กำลังค้นหาและเปรียบเทียบกลยุทธ์..."):
+            candidates = []
+            comparisons = []
+            for selected_indicator in indicators:
+                candidate_best, candidate_history, candidate_fitness = run_ga(
+                    data, int(population_size), int(generations), float(crossover_rate),
+                    float(mutation_rate), int(elite_count), float(fee_pct), int(seed),
+                    selected_indicator, direction
+                )
+                _, candidate_metrics, candidate_curves = evaluate_strategy(
+                    data, candidate_best[0], candidate_best[1], candidate_best[2],
+                    candidate_best[3], candidate_best[4], float(fee_pct),
+                    indicator=selected_indicator, direction=direction
+                )
+                comparisons.append({
+                    "Indicator": selected_indicator,
+                    "Fitness": candidate_fitness,
+                    "Total Return": candidate_metrics["Total Return"],
+                    "Sharpe Ratio": candidate_metrics["Sharpe Ratio"],
+                    "Max Drawdown": candidate_metrics["Max Drawdown"],
+                    "Trades / Position Changes": candidate_metrics["Trades"],
+                })
+                candidates.append({
+                    "best": candidate_best, "history": candidate_history,
+                    "fitness": candidate_fitness, "metrics": candidate_metrics,
+                    "curves": candidate_curves, "indicator": selected_indicator,
+                })
+            chosen = max(candidates, key=lambda item: item["fitness"])
+            st.session_state["trading_result"] = {
+                **chosen, "comparison": pd.DataFrame(comparisons),
+                "ticker": ticker if source == "Download from Yahoo Finance" else "Uploaded CSV",
+                "fee": float(fee_pct), "direction": direction,
+                "indicators_tested": indicators.copy(),
+                "start_date": str(start_date) if start_date else None,
+                "end_date": str(end_date) if end_date else None,
+            }
 
 result = st.session_state.get("trading_result")
 tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "🧬 GA Optimization", "📉 Backtesting", "⚙️ Best Strategy"])
@@ -362,6 +429,11 @@ else:
     metrics = result["metrics"]
     with tab1:
         st.subheader("Optimization Summary")
+        st.caption(f"Best Indicator: {result.get('indicator', 'SMA + RSI')} · Direction: {result.get('direction', 'Long')}")
+        st.caption("เมื่อเลือกหลาย Indicator ระบบจะ optimize แยกทีละตัว แล้วเลือกผลที่มี Fitness สูงสุด ไม่ได้รวมสัญญาณหลาย Indicator เป็นกลยุทธ์เดียว")
+        if len(result.get("indicators_tested", [])) > 1:
+            st.markdown("**Indicator Comparison**")
+            st.dataframe(result["comparison"].sort_values("Fitness", ascending=False), use_container_width=True, hide_index=True)
         x1, x2, x3, x4 = st.columns(4)
         x1.metric("Strategy Return", f"{metrics['Total Return']:.2%}")
         x2.metric("Buy & Hold Return", f"{metrics['Buy & Hold']:.2%}")
@@ -377,17 +449,40 @@ else:
         st.code(
     f"[Fast MA={best[0]}, Slow MA={best[1]}, "
     f"RSI Period={best[2]}, RSI Buy={best[3]}, "
-    f"RSI Sell={best[4]}]",
+    f"RSI Sell={best[4]}]\nIndicator={result.get('indicator', 'SMA + RSI')}, Direction={result.get('direction', 'Long')}",
     language="text"
 )
         st.caption("Chromosome = ชุดพารามิเตอร์ของกลยุทธ์; Fitness ให้คะแนนจากผลตอบแทน, Sharpe Ratio และการหักโทษ Maximum Drawdown")
     with tab3:
         st.subheader("Backtesting Performance")
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Total Return", f"{metrics['Total Return']:.2%}")
         m2.metric("Trades / position changes", f"{metrics['Trades']}")
-        m3.metric("Max Drawdown", f"{metrics['Max Drawdown']:.2%}")
+        m3.metric("Win Rate (active days)", f"{metrics['Win Rate (active days)']:.2f}%")
+        m4.metric("Max Drawdown", f"{metrics['Max Drawdown']:.2%}")
         st.line_chart(result["curves"][["Strategy Equity", "Buy & Hold Equity"]], height=300)
+
+        st.subheader("📍 Buy / Sell Signals")
+        signal_frame = pd.DataFrame({"Close": data["Close"], "Position": result["curves"]["Position"]}, index=data.index)
+        previous_position = signal_frame["Position"].shift(1).fillna(0)
+        buy_mask = (signal_frame["Position"] > 0) & (previous_position <= 0)
+        sell_mask = (signal_frame["Position"] <= 0) & (previous_position > 0)
+        short_mask = (signal_frame["Position"] < 0) & (previous_position >= 0)
+        cover_mask = (signal_frame["Position"] >= 0) & (previous_position < 0)
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.plot(signal_frame.index, signal_frame["Close"], label="Close Price", linewidth=1.4)
+        ax.scatter(signal_frame.index[buy_mask], signal_frame.loc[buy_mask, "Close"], marker="^", s=70, label="Buy / Long", zorder=3)
+        ax.scatter(signal_frame.index[sell_mask], signal_frame.loc[sell_mask, "Close"], marker="v", s=70, label="Sell / Exit Long", zorder=3)
+        ax.scatter(signal_frame.index[short_mask], signal_frame.loc[short_mask, "Close"], marker="v", s=70, label="Open Short", zorder=3)
+        ax.scatter(signal_frame.index[cover_mask], signal_frame.loc[cover_mask, "Close"], marker="^", s=70, label="Cover Short", zorder=3)
+        ax.set_title(f"{result.get('ticker', 'Asset')} — {result.get('indicator')} signals")
+        ax.set_xlabel("Date / Row")
+        ax.set_ylabel("Price")
+        ax.grid(True, alpha=.25)
+        ax.legend(loc="best", ncol=2)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
         
         st.subheader("📊 Risk & Trade Statistics")
 
@@ -402,32 +497,56 @@ else:
         r3.metric("Number of Position Changes", f"{metrics['Trades']}")
 
         st.subheader("📈 Technical Indicators")
-        st.line_chart(result["curves"][["Fast MA", "Slow MA"]], height=220)
+        if result.get("indicator") == "EMA Crossover":
+            st.line_chart(result["curves"][["Fast EMA", "Slow EMA"]], height=220)
+        elif result.get("indicator") == "MACD":
+            st.line_chart(result["curves"][["MACD", "MACD Signal"]], height=220)
+        elif result.get("indicator") == "Bollinger Bands":
+            st.line_chart(result["curves"][["BB Upper", "BB Middle", "BB Lower"]], height=220)
+        else:
+            st.line_chart(result["curves"][["Fast MA", "Slow MA"]], height=220)
         st.line_chart(result["curves"][["RSI"]], height=180)
 
+        with st.expander("ℹ️ How to read these metrics"):
+            st.markdown("""
+            - **Total Return:** ผลตอบแทนสะสมของกลยุทธ์หลังหัก Trading Fee ตามแบบจำลอง
+            - **Win Rate (active days):** สัดส่วนวันที่ถือสถานะแล้วผลตอบแทนรายวันเป็นบวก ไม่ใช่ Win Rate ของเทรดที่ปิดแล้ว
+            - **Profit Factor (daily):** คำนวณจากผลตอบแทนรายวันบวกเทียบกับผลตอบแทนรายวันลบ ไม่ใช่กำไรรวมต่อรอบเทรด
+            - **Maximum Drawdown:** การลดลงสูงสุดของ Equity จากจุดสูงสุดก่อนหน้า
+            - **Buy/Sell markers:** จุดเปลี่ยนสถานะที่ปรากฏบนกราฟราคาปิด
+            """)
         st.subheader("⬇️ Export Results")
 
+        backtest_export = result["curves"].copy()
+        backtest_export["Indicator"] = result.get("indicator", "SMA + RSI")
+        backtest_export["Direction"] = result.get("direction", "Long")
         st.download_button(
             "Download Backtest Results (CSV)",
-            data=result["curves"].to_csv(index=True).encode("utf-8-sig"),
+            data=backtest_export.to_csv(index=True).encode("utf-8-sig"),
             file_name="trading_backtest_results.csv",
             mime="text/csv",
         )
 
+        fitness_export = result["history"].copy()
+        fitness_export["Indicator"] = result.get("indicator", "SMA + RSI")
+        fitness_export["Direction"] = result.get("direction", "Long")
         st.download_button(
             "Download Fitness History (CSV)",
-            data=result["history"].to_csv(index=False).encode("utf-8-sig"),
+            data=fitness_export.to_csv(index=False).encode("utf-8-sig"),
             file_name="ga_fitness_history.csv",
             mime="text/csv",
         )
 
         strategy_params = pd.DataFrame([{
+            "Indicator": result.get("indicator", "SMA + RSI"),
+            "Direction": result.get("direction", "Long"),
             "Fast MA": best[0],
             "Slow MA": best[1],
             "RSI Period": best[2],
             "RSI Buy": best[3],
             "RSI Sell": best[4],
             "Fitness": result["fitness"],
+            "Trading Fee (%)": result["fee"],
         }])
 
         st.download_button(
@@ -443,6 +562,7 @@ else:
     with tab4:
        
         st.subheader("Optimized Trading Rules")
+        st.write(f"Indicator: **{result.get('indicator', 'SMA + RSI')}** · Direction: **{result.get('direction', 'Long')}**")
         p1, p2, p3, p4, p5 = st.columns(5)
 
         p1.metric("Fast MA", f"{best[0]} days")
@@ -452,21 +572,50 @@ else:
         p5.metric("RSI Sell", f"{best[4]}")
 
         st.markdown("**Rule interpretation**")
-        st.write(
-            f"- เปิดสถานะ Long เมื่อ Fast MA ({best[0]}) "
-            f"สูงกว่า Slow MA ({best[1]}) และ RSI ({best[2]} วัน) "
-            f"ต่ำกว่าหรือเท่ากับ {best[3]}."
-        )
-        st.write(
-            f"- ปิดสถานะเมื่อ Fast MA ต่ำกว่า Slow MA "
-            f"หรือ RSI สูงกว่าหรือเท่ากับ {best[4]}."
-        )
-        st.write(
-            f"- คิดค่าธรรมเนียม {result['fee']:.2f}% "
-            f"ต่อการเปลี่ยนสถานะหนึ่งครั้ง"
-        )
+        selected_indicator = result.get("indicator", "SMA + RSI")
+        selected_direction = result.get("direction", "Long")
+
+        if selected_indicator == "SMA + RSI":
+            rule_text = (
+                f"ใช้ SMA {best[0]} วัน และ SMA {best[1]} วันร่วมกับ RSI {best[2]} วัน; "
+                f"ระดับ RSI เข้า = {best[3]} และออก = {best[4]}."
+            )
+        elif selected_indicator == "SMA Crossover":
+            rule_text = f"ใช้ SMA crossover: Fast SMA {best[0]} วัน เทียบกับ Slow SMA {best[1]} วัน."
+        elif selected_indicator == "EMA Crossover":
+            rule_text = f"ใช้ EMA crossover: Fast EMA {best[0]} วัน เทียบกับ Slow EMA {best[1]} วัน."
+        elif selected_indicator == "RSI":
+            rule_text = f"ใช้ RSI {best[2]} วัน; ระดับเข้า = {best[3]} และระดับออก = {best[4]}."
+        elif selected_indicator == "MACD":
+            rule_text = (
+                f"ใช้ MACD จาก EMA {best[0]} และ {best[1]} วัน "
+                f"โดยใช้ EMA {best[2]} วันเป็น signal line."
+            )
+        else:
+            rule_text = (
+                f"ใช้ Bollinger Bands จากค่าเฉลี่ย {best[1]} วัน "
+                "และแถบห่างจากค่าเฉลี่ย 2 standard deviations."
+            )
+
+        st.write(f"- **Indicator rule:** {rule_text}")
+        direction_text = {
+            "Long": "เปิดสถานะซื้อ (Long) เท่านั้น",
+            "Short": "เปิดสถานะขายชอร์ต (Short) เท่านั้น",
+            "Both": "อนุญาตทั้งสถานะ Long และ Short",
+        }.get(selected_direction, selected_direction)
+        st.write(f"- **Trading direction:** {direction_text}")
+        st.write(f"- **Trading fee:** {result['fee']:.2f}% ต่อการเปลี่ยนสถานะหนึ่งหน่วย")
+
+        if selected_indicator in ("SMA Crossover", "EMA Crossover"):
+            st.caption("หมายเหตุ: RSI Period และ RSI thresholds ไม่ได้เป็นตัวกำหนดสัญญาณของ Crossover indicator นี้")
+        elif selected_indicator == "RSI":
+            st.caption("หมายเหตุ: Fast/Slow MA ไม่ได้เป็นตัวกำหนดสัญญาณของ RSI indicator นี้")
+        elif selected_indicator == "Bollinger Bands":
+            st.caption("หมายเหตุ: Fast MA, RSI Period และ RSI thresholds ไม่ได้เป็นตัวกำหนดสัญญาณ Bollinger Bands ในเวอร์ชันนี้")
+        elif selected_indicator == "MACD":
+            st.caption("หมายเหตุ: RSI Buy/Sell ไม่ได้เป็นตัวกำหนดสัญญาณ MACD ในเวอร์ชันนี้")
         st.warning(
-            "นี่คือโปรโตไทป์เพื่อการศึกษา กลยุทธ์นี้เป็น Long/Cash เท่านั้น "
+            "นี่คือโปรโตไทป์เพื่อการศึกษา ผล Backtesting เป็นการจำลองจากข้อมูลในอดีตเท่านั้น "
             "และยังไม่รวม slippage, ภาษี, การส่งคำสั่งจริง "
             "หรือการป้องกัน overfitting"
         )
